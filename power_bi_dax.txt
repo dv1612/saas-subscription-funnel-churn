@@ -1,0 +1,237 @@
+================================================================================
+POWER BI - DAX  |  SaaS Subscription Funnel & Churn
+================================================================================
+
+MODEL
+  vw_subscriptions      one row per paying customer (user_id, plan, mrr, status,
+                        signup_date, churn_date, cohort_month, tenure_months)
+  vw_cohort_retention   cohort_month x month_number grain (long, not pivoted)
+  vw_mrr_movement       one row per calendar month (new / lost / active MRR)
+  funnel_metrics        one row per funnel stage (from funnel_analysis.py)
+  Date                  marked as the date table (DAX below)
+
+RELATIONSHIPS
+  Date[Date] 1 --> * vw_subscriptions[signup_date]      (active)
+  Date[Date] 1 --> * vw_mrr_movement[month]             (active)
+  vw_cohort_retention and funnel_metrics stay disconnected - they are already
+  aggregated, and joining them to Date would double-filter the measures.
+
+
+--------------------------------------------------------------------------------
+1. DATE TABLE  ->  Modeling > New table
+--------------------------------------------------------------------------------
+
+Date =
+VAR MinDate = MIN ( vw_subscriptions[signup_date] )
+VAR MaxDate = MAX ( vw_mrr_movement[month] )
+RETURN
+    ADDCOLUMNS (
+        CALENDAR ( DATE ( YEAR ( MinDate ), MONTH ( MinDate ), 1 ), EOMONTH ( MaxDate, 0 ) ),
+        "Year",       YEAR ( [Date] ),
+        "Month",      FORMAT ( [Date], "MMM yyyy" ),
+        "MonthStart", DATE ( YEAR ( [Date] ), MONTH ( [Date] ), 1 ),
+        "MonthKey",   YEAR ( [Date] ) * 100 + MONTH ( [Date] )
+    )
+-- Sort the Month column by MonthKey, then mark the table as a date table.
+
+
+--------------------------------------------------------------------------------
+2. CORE CHURN & RETENTION MEASURES  ->  table: _Measures
+--------------------------------------------------------------------------------
+
+Total Users =
+DISTINCTCOUNT ( vw_subscriptions[user_id] )
+
+
+Churned Users =
+CALCULATE (
+    [Total Users],
+    KEEPFILTERS ( vw_subscriptions[status] = "Churned" )
+)
+
+
+Active Users =
+CALCULATE (
+    [Total Users],
+    KEEPFILTERS ( vw_subscriptions[status] = "Active" )
+)
+
+
+Churn Rate =
+DIVIDE ( [Churned Users], [Total Users] )
+-- Lifetime (all-time) churn rate. For a period rate, use Monthly Logo Churn %.
+
+
+Retention Rate =
+1 - [Churn Rate]
+
+
+--------------------------------------------------------------------------------
+3. MRR MEASURES
+--------------------------------------------------------------------------------
+
+Total Active MRR =
+CALCULATE (
+    SUM ( vw_subscriptions[mrr] ),
+    KEEPFILTERS ( vw_subscriptions[status] = "Active" )
+)
+
+
+Lost MRR =
+CALCULATE (
+    SUM ( vw_subscriptions[mrr] ),
+    KEEPFILTERS ( vw_subscriptions[status] = "Churned" )
+)
+
+
+Net New MRR =
+SUM ( vw_mrr_movement[new_mrr] ) - SUM ( vw_mrr_movement[lost_mrr] )
+
+
+ARPA =
+DIVIDE ( [Total Active MRR], [Active Users] )
+
+
+-- Monthly rates, measured against the base that was exposed to churn: the
+-- customers on the book at the END of the previous month.
+Monthly MRR Churn % =
+VAR LostThisMonth = SUM ( vw_mrr_movement[lost_mrr] )
+VAR OpeningMRR =
+    CALCULATE (
+        SUM ( vw_mrr_movement[active_mrr] ),
+        DATEADD ( 'Date'[Date], -1, MONTH )
+    )
+RETURN
+    DIVIDE ( LostThisMonth, OpeningMRR )
+
+
+Monthly Logo Churn % =
+VAR ChurnedThisMonth = SUM ( vw_mrr_movement[churned_customers] )
+VAR OpeningCustomers =
+    CALCULATE (
+        SUM ( vw_mrr_movement[active_customers] ),
+        DATEADD ( 'Date'[Date], -1, MONTH )
+    )
+RETURN
+    DIVIDE ( ChurnedThisMonth, OpeningCustomers )
+
+
+-- Net revenue retention, the number a SaaS board asks for first.
+Net Revenue Retention % =
+VAR OpeningMRR =
+    CALCULATE ( SUM ( vw_mrr_movement[active_mrr] ), DATEADD ( 'Date'[Date], -1, MONTH ) )
+VAR ClosingMRR = SUM ( vw_mrr_movement[active_mrr] )
+VAR NewMRR = SUM ( vw_mrr_movement[new_mrr] )
+RETURN
+    DIVIDE ( ClosingMRR - NewMRR, OpeningMRR )
+
+
+--------------------------------------------------------------------------------
+4. COHORT MEASURES  ->  for the Matrix visual
+--------------------------------------------------------------------------------
+
+Cohort Retention % =
+VAR Retained = SUM ( vw_cohort_retention[retained_users] )
+VAR CohortBase =
+    SUMX (
+        VALUES ( vw_cohort_retention[cohort_month] ),
+        CALCULATE ( MAX ( vw_cohort_retention[cohort_users] ) )
+    )
+RETURN
+    DIVIDE ( Retained, CohortBase )
+-- SUMX over cohort_month keeps the subtotal/total row correct; a plain
+-- SUM(cohort_users) would count the cohort size once per month column.
+
+
+Cohort MRR Retention % =
+VAR RetainedMRR = SUM ( vw_cohort_retention[retained_mrr] )
+VAR BaseMRR =
+    SUMX (
+        VALUES ( vw_cohort_retention[cohort_month] ),
+        CALCULATE (
+            MAXX (
+                FILTER ( ALL ( vw_cohort_retention ),
+                         vw_cohort_retention[cohort_month] = EARLIER ( vw_cohort_retention[cohort_month] )
+                      && vw_cohort_retention[month_number] = 0 ),
+                vw_cohort_retention[retained_mrr]
+            )
+        )
+    )
+RETURN
+    DIVIDE ( RetainedMRR, BaseMRR )
+
+
+--------------------------------------------------------------------------------
+5. FUNNEL MEASURES
+--------------------------------------------------------------------------------
+
+Users Reached =
+SUM ( funnel_metrics[users_reached] )
+
+
+Step Conversion % =
+DIVIDE ( AVERAGE ( funnel_metrics[step_conversion_pct] ), 100 )
+
+
+Drop-off % =
+DIVIDE ( AVERAGE ( funnel_metrics[relative_dropoff_pct] ), 100 )
+
+
+Signup to Paid % =
+VAR Signups =
+    CALCULATE ( [Users Reached], ALL ( funnel_metrics ), funnel_metrics[stage_order] = 1 )
+VAR Paid =
+    CALCULATE ( [Users Reached], ALL ( funnel_metrics ), funnel_metrics[stage_order] = 4 )
+RETURN
+    DIVIDE ( Paid, Signups )
+
+
+--------------------------------------------------------------------------------
+6. CALCULATED COLUMN  ->  table: vw_subscriptions
+--------------------------------------------------------------------------------
+
+Tenure Bucket =
+SWITCH (
+    TRUE (),
+    vw_subscriptions[tenure_months] = 0,  "0 - first month",
+    vw_subscriptions[tenure_months] <= 3, "1-3 months",
+    vw_subscriptions[tenure_months] <= 6, "4-6 months",
+    vw_subscriptions[tenure_months] <= 12, "7-12 months",
+    "12+ months"
+)
+-- Sort by a matching Tenure Sort column (0,1,2,3,4) so the axis reads in order.
+
+
+--------------------------------------------------------------------------------
+7. WHICH VISUAL FOR WHICH METRIC
+--------------------------------------------------------------------------------
+
+| Metric                      | Visual                | Setup                              |
+|-----------------------------|-----------------------|------------------------------------|
+| Cohort retention            | **Matrix**            | Rows: cohort_month · Columns:
+|                             |                       | month_number · Values: [Cohort
+|                             |                       | Retention %] · conditional
+|                             |                       | background colour, diverging off a
+|                             |                       | single hue. This is the one visual
+|                             |                       | that must not be a chart.          |
+| Funnel stages               | **Funnel chart**       | Group: funnel_stage (sorted by
+|                             |                       | stage_order) · Values: [Users
+|                             |                       | Reached]. Turn on conversion-rate
+|                             |                       | labels.                            |
+| Churn Rate, Retention Rate, | **KPI / Card**        | One card each, two decimals. Add a
+| Total Active MRR, Lost MRR  |                       | trend line on the MRR cards.       |
+| MRR movement by month       | **Line and clustered  | Columns: new_mrr and -lost_mrr ·
+|                             | column chart**        | Line: [Total Active MRR].          |
+| New vs lost MRR bridge      | **Waterfall chart**   | Category: Date[Month] · Y: [Net New
+|                             |                       | MRR] · breakdown by status.        |
+| Churn by plan / channel     | **Clustered bar**     | Axis: plan · Value: [Churn Rate] ·
+|                             |                       | sorted descending.                 |
+| Survival by tenure          | **Line chart**        | Axis: Tenure Bucket · Value:
+|                             |                       | [Retention Rate].                  |
+| Slicers                     | plan, acquisition_channel, Date[Month]                     |
+
+Formatting: Churn Rate / Retention Rate / NRR as percentage with 1 decimal;
+MRR measures as currency, 0 decimals; Users Reached as whole number.
+
+Layout: KPI row across the top, funnel chart on the left, cohort matrix on the
+right (it needs the width), MRR movement full-width underneath.

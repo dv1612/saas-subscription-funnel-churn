@@ -1,0 +1,9 @@
+# Generated data - recreate with generate_mock_data.py and the pipeline
+data/raw/*
+data/clean/*
+!data/raw/.gitkeep
+!data/clean/.gitkeep
+
+__pycache__/
+*.pyc
+.venv/
